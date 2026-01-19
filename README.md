@@ -5,7 +5,7 @@ A Go wrapper for the [mail.tm](https://mail.tm) API. Based on [pymailtm](https:/
 ## Installation
 
 ```bash
-go get github.com/yourusername/tempmail
+go get github.com/AriesxBackup/tempmail
 ```
 
 ## Quick Start
