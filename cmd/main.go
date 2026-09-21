@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -13,8 +15,9 @@ import (
 func main() {
 	newAccount := flag.Bool("new", false, "Create a new email account")
 	count := flag.Int("count", 1, "Number of email accounts to create")
-	email := flag.String("email", "", "Email address to login")
-	password := flag.String("password", "", "Password for the email account")
+	email := flag.String("email", "", "Existing email address to use")
+	password := flag.String("password", "", "Password for a new account (auto-generated if empty)")
+	apiKey := flag.String("key", os.Getenv("SMTPDEV_API_KEY"), "smtp.dev API key (or set SMTPDEV_API_KEY)")
 	fetch := flag.Bool("fetch", false, "Fetch all messages from inbox")
 	domains := flag.Bool("domains", false, "List available email domains")
 	monitor := flag.Int("monitor", 0, "Monitor inbox for N minutes")
@@ -22,7 +25,12 @@ func main() {
 
 	flag.Parse()
 
-	client := tempmail.NewClient()
+	if *apiKey == "" {
+		fmt.Println("Error: an API key is required (use --key or SMTPDEV_API_KEY). Get one at https://smtp.dev/tokens")
+		os.Exit(1)
+	}
+
+	client := tempmail.NewClient(tempmail.WithAPIKey(*apiKey))
 
 	if *domains {
 		domainList, err := client.GetDomains()
@@ -42,8 +50,8 @@ func main() {
 		var accounts []tempmail.Account
 
 		for i := 0; i < *count; i++ {
-			c := tempmail.NewClient()
-			account, err := c.CreateAccount("")
+			c := tempmail.NewClient(tempmail.WithAPIKey(*apiKey))
+			account, err := c.CreateAccount(*password)
 			if err != nil {
 				fmt.Printf("Error creating account %d: %v\n\n", i+1, err)
 				continue
@@ -60,16 +68,24 @@ func main() {
 		return
 	}
 
-	if *email != "" && *password != "" {
-		fmt.Printf("Logging into %s...\n", *email)
-		if err := client.Login(*email, *password); err != nil {
+	if *email != "" && !*newAccount {
+		fmt.Printf("Looking up %s...\n", *email)
+		if _, err := client.UseAccount(*email); err != nil {
 			fmt.Printf("Error: %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Println("Logged in successfully!")
-	} else if *newAccount || (*email == "" && *password == "") {
+		fmt.Println("Account found!")
+	} else {
 		fmt.Println("Creating new temporary email account...")
-		account, err := client.CreateAccount("")
+		var (
+			account *tempmail.Account
+			err     error
+		)
+		if *email != "" {
+			account, err = client.CreateAccountWithAddress(*email, *password)
+		} else {
+			account, err = client.CreateAccount(*password)
+		}
 		if err != nil {
 			fmt.Printf("Error: %v\n", err)
 			os.Exit(1)
@@ -111,36 +127,23 @@ func main() {
 		}
 		fmt.Println("Press Ctrl+C to stop")
 
-		startTime := time.Now()
-		duration := time.Duration(*monitor) * time.Minute
-		checkCount := 0
+		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(*monitor)*time.Minute)
+		defer cancel()
 
-		for time.Since(startTime) < duration {
-			checkCount++
-			messages, err := client.GetMessages(1)
+		received := 0
+		for {
+			msg, err := client.WaitForMessage(ctx)
 			if err != nil {
-				fmt.Printf("Error: %v\n", err)
+				if !errors.Is(err, tempmail.ErrTimeout) {
+					fmt.Printf("Error: %v\n", err)
+				}
 				break
 			}
-
-			fmt.Printf("Check #%d - %d message(s)\n", checkCount, len(messages))
-
-			if len(messages) > 0 {
-				displayMessages(messages)
-			}
-
-			remaining := duration - time.Since(startTime)
-			if remaining > 30*time.Second {
-				fmt.Printf("Next check in 30s (remaining: %dm %ds)\n\n",
-					int(remaining.Minutes()), int(remaining.Seconds())%60)
-				time.Sleep(30 * time.Second)
-			} else {
-				break
-			}
+			received++
+			displayMessages([]tempmail.Message{*msg})
 		}
 
-		finalMessages, _ := client.GetMessages(1)
-		fmt.Printf("\nFinal: %d total message(s)\n", len(finalMessages))
+		fmt.Printf("\nFinal: %d new message(s) received\n", received)
 	}
 
 	if *deleteAccount && client.GetAccount() != nil {
@@ -166,8 +169,8 @@ func displayMessages(messages []tempmail.Message) {
 	for i, msg := range messages {
 		fmt.Printf("\n[%d] %s\n", i+1, msg.Subject)
 		fmt.Printf("    From: %s\n", msg.From.Address)
-		fmt.Printf("    Date: %s\n", msg.CreatedAt)
-		if msg.Seen {
+		fmt.Printf("    Date: %s\n", msg.Date)
+		if msg.IsRead {
 			fmt.Println("    Status: Read")
 		} else {
 			fmt.Println("    Status: Unread")

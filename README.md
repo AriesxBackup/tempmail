@@ -1,11 +1,19 @@
 # tempmail
 
-A Go wrapper for the [mail.tm](https://mail.tm) API. Based on [pymailtm](https://github.com/CarloDePieri/pymailtm).
+A Go wrapper for the [smtp.dev](https://smtp.dev/docs/api/) API ([OpenAPI spec](https://api.smtp.dev/docs.jsonopenapi)).
 
 ## Installation
 
 ```bash
 go get github.com/AriesxBackup/tempmail
+```
+
+## Authentication
+
+Every request needs an API key from [smtp.dev/tokens](https://smtp.dev/tokens), sent as the `X-API-KEY` header.
+
+```go
+client := tempmail.NewClient(tempmail.WithAPIKey(os.Getenv("SMTPDEV_API_KEY")))
 ```
 
 ## Quick Start
@@ -14,141 +22,167 @@ go get github.com/AriesxBackup/tempmail
 package main
 
 import (
+    "context"
     "fmt"
     "log"
+    "os"
+    "time"
+
     "tempmail/pkg/tempmail"
 )
 
 func main() {
-    client := tempmail.NewClient()
-    
-    // Create account
+    client := tempmail.NewClient(tempmail.WithAPIKey(os.Getenv("SMTPDEV_API_KEY")))
+
     account, err := client.CreateAccount("")
     if err != nil {
         log.Fatal(err)
     }
-    
     fmt.Printf("Email: %s\n", account.Address)
-    fmt.Printf("Password: %s\n", account.Password)
-    
-    // Fetch messages
-    messages, _ := client.GetMessages(1)
-    fmt.Printf("Messages: %d\n", len(messages))
+
+    ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+    defer cancel()
+
+    msg, err := client.WaitForMessage(ctx)
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Println(msg.Subject, msg.Text)
 }
 ```
 
 ## CLI Usage
 
 ```bash
-# Build
+export SMTPDEV_API_KEY=smtplabs_...
+
 go build -o tempmail ./cmd
 
-# Create new account
-./tempmail --new
-
-# Create and fetch messages
 ./tempmail --new --fetch
-
-# Create multiple accounts
 ./tempmail --count 5
-
-# Login to existing account
-./tempmail --email user@domain.com --password pass --fetch
-
-# List available domains
+./tempmail --email user@domain.com --fetch
 ./tempmail --domains
-
-# Monitor inbox
 ./tempmail --new --monitor 10
-
-# Delete account after use
 ./tempmail --new --fetch --delete
 ```
 
 ## API Reference
 
-### Create Client
+The client has an "active account" (set by `CreateAccount`, `CreateAccountWithAddress`, `UseAccount` or `SetAccount`). The inbox helpers (`GetMessages`, `GetMessage`, `MarkMessageRead`, `DeleteMessage`, `WaitForMessage`, `Send`) operate on that account's `INBOX`. Everything else takes explicit IDs.
+
+### Client options
 
 ```go
-client := tempmail.NewClient()
-
-// With options
-client := tempmail.NewClient(
-    tempmail.WithAPIAddress("https://api.mail.tm"),
-    tempmail.WithTimeout(60 * time.Second),
+tempmail.NewClient(
+    tempmail.WithAPIKey("smtplabs_..."),
+    tempmail.WithAPIAddress("https://api.smtp.dev"),
+    tempmail.WithTimeout(60*time.Second),
+    tempmail.WithHTTPClient(customHTTPClient),
 )
 ```
 
-### Create Account
+### Accounts
 
 ```go
-// Auto-generate password
-account, err := client.CreateAccount("")
-
-// Custom password
-account, err := client.CreateAccount("mypassword")
+account, err := client.CreateAccount("")                        // random address on an active domain
+account, err := client.CreateAccountWithAddress("me@x.com", "") // password auto-generated if empty
+account, err := client.UseAccount("me@x.com")                   // attach to an existing account
+accounts, err := client.ListAccounts(1, "", nil)
+account, err := client.GetAccountByID(id)
+account, err := client.UpdateAccount(id, "newpass", &isActive)
+err := client.DeleteAccount()                                   // active account
+err := client.DeleteAccountByID(id)
 ```
 
-### Login
+### Domains
 
 ```go
-err := client.Login("email@domain.com", "password")
+names, err := client.GetDomains()                 // active domain names
+domains, err := client.ListDomains(1, "", nil)
+domain, err := client.CreateDomain("example.com", true)
+domain, err := client.UpdateDomain(id, false)
+err := client.DeleteDomain(id)
 ```
 
-### Get Messages
+### Mailboxes
 
 ```go
-messages, err := client.GetMessages(1) // page number
+mailboxes, err := client.ListMailboxes(accountID, 1, "")
+mailbox, err := client.CreateMailbox(accountID, "Archive")
+mailbox, err := client.UpdateMailbox(accountID, id, "Renamed")
+err := client.DeleteMailbox(accountID, id)
 ```
 
-### Get Single Message
+### Messages (inbox helpers)
 
 ```go
+messages, err := client.GetMessages(1)         // page number, newest first
 msg, err := client.GetMessage("message-id")
-```
-
-### Mark Message as Seen
-
-```go
-err := client.MarkMessageSeen("message-id")
-```
-
-### Delete Message
-
-```go
+err := client.MarkMessageRead("message-id")
 err := client.DeleteMessage("message-id")
+msg, err := client.WaitForMessage(ctx)         // blocks until a new message arrives
 ```
 
-### Delete Account
+### Messages (any mailbox)
 
 ```go
-err := client.DeleteAccount()
+messages, err := client.ListMessages(accountID, mailboxID, 1)
+msg, err := client.FetchMessage(accountID, mailboxID, id)
+
+read := true
+msg, err := client.UpdateMessage(accountID, mailboxID, id, tempmail.MessageUpdate{IsRead: &read})
+
+err := client.MoveMessage(accountID, mailboxID, id, targetMailboxID)
+err := client.RemoveMessage(accountID, mailboxID, id)
+
+raw, err := client.GetMessageSource(accountID, mailboxID, id)
+eml, err := client.DownloadMessage(accountID, mailboxID, id)
+data, err := client.DownloadAttachment(accountID, mailboxID, id, attachmentID)
 ```
 
-### Wait for New Message
+### Sending
 
 ```go
-msg, err := client.WaitForMessage()
+err := client.Send(tempmail.SendMessageRequest{
+    To:      []tempmail.Address{{Address: "you@example.com"}},
+    Subject: "Hello",
+    Text:    "Hi there",
+})
 ```
+
+### API tokens and Mercure
+
+```go
+token, err := client.CreateToken("ci", "used by CI") // token value is only returned once
+tokens, err := client.ListTokens(1, "")
+err := client.DeleteToken(id)
+
+jwt, err := client.GetMercureToken()
+```
+
+For real-time updates, subscribe to `tempmail.MercureAddress` with `Authorization: Bearer <jwt>` and topic `/accounts/{id}{+path}`.
+
+### Errors
+
+Non-2xx responses return `*tempmail.APIError` (with `StatusCode` and `Message`). `errors.Is(err, tempmail.ErrNotFound)` matches 404s. The API is rate limited to 4096 requests/minute.
 
 ## Project Structure
 
 ```
 .
-├── cmd/
-│   └── main.go           # CLI application
-├── example/
-│   └── main.go           # Example usage
-├── pkg/
-│   └── tempmail/
-│       ├── client.go     # Main client
-│       ├── client_test.go
-│       ├── errors.go     # Error types
-│       ├── models.go     # Data structures
-│       ├── utils.go      # Helpers
-│       └── utils_test.go
+├── cmd/main.go               # CLI application
+├── example/main.go           # Example usage
+├── pkg/tempmail/
+│   ├── client.go             # Client, options, HTTP plumbing
+│   ├── accounts.go
+│   ├── domains.go
+│   ├── mailboxes.go
+│   ├── messages.go
+│   ├── tokens.go             # API tokens + Mercure token
+│   ├── errors.go
+│   ├── models.go
+│   └── utils.go
 ├── go.mod
-├── .gitignore
 └── README.md
 ```
 

@@ -1,13 +1,31 @@
 package tempmail
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+)
 
 var (
-	ErrNotAuthenticated     = errors.New("not authenticated")
-	ErrNoActiveAccount      = errors.New("no active account")
-	ErrNoDomains            = errors.New("no domains available")
-	ErrCouldNotGetMessages  = errors.New("could not get messages")
-	ErrCouldNotGetAccount   = errors.New("could not get account")
-	ErrCouldNotUpdateMessage = errors.New("could not update message")
-	ErrAddressRequired      = errors.New("address and password required")
+	ErrAPIKeyRequired  = errors.New("api key required")
+	ErrNoActiveAccount = errors.New("no active account")
+	ErrNoDomains       = errors.New("no active domains available")
+	ErrNotFound        = errors.New("not found")
+	ErrTimeout         = errors.New("timed out waiting for message")
+	ErrMailboxNotFound = errors.New("mailbox not found")
 )
+
+type APIError struct {
+	StatusCode int
+	Message    string
+}
+
+func (e *APIError) Error() string {
+	if e.Message == "" {
+		return fmt.Sprintf("api error: HTTP %d", e.StatusCode)
+	}
+	return fmt.Sprintf("api error: HTTP %d - %s", e.StatusCode, e.Message)
+}
+
+func (e *APIError) Is(target error) bool {
+	return target == ErrNotFound && e.StatusCode == 404
+}

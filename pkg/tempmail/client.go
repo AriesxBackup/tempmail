@@ -3,33 +3,44 @@ package tempmail
 import (
 	"bytes"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 )
 
 const (
-	APIAddress            = "https://api.mail.tm"
+	APIAddress            = "https://api.smtp.dev"
+	MercureAddress        = "https://mercure.smtp.dev/.well-known/mercure"
 	DefaultTimeout        = 30 * time.Second
 	DefaultUsernameLength = 10
-	DefaultPasswordLength = 6
+	DefaultPasswordLength = 12
 	PollInterval          = 2 * time.Second
+	InboxPath             = "INBOX"
+
+	contentTypeLD         = "application/ld+json"
+	contentTypeMergePatch = "application/merge-patch+json"
 )
 
 type Client struct {
-	apiAddress  string
-	httpClient  *http.Client
-	account     *Account
-	token       string
-	authHeaders map[string]string
+	apiAddress string
+	apiKey     string
+	httpClient *http.Client
+	account    *Account
 }
 
 type ClientOption func(*Client)
 
 func WithAPIAddress(url string) ClientOption {
 	return func(c *Client) {
-		c.apiAddress = url
+		c.apiAddress = strings.TrimRight(url, "/")
+	}
+}
+
+func WithAPIKey(key string) ClientOption {
+	return func(c *Client) {
+		c.apiKey = key
 	}
 }
 
@@ -51,7 +62,6 @@ func NewClient(opts ...ClientOption) *Client {
 		httpClient: &http.Client{
 			Timeout: DefaultTimeout,
 		},
-		authHeaders: make(map[string]string),
 	}
 
 	for _, opt := range opts {
@@ -61,344 +71,124 @@ func NewClient(opts ...ClientOption) *Client {
 	return c
 }
 
-func (c *Client) GetDomains() ([]string, error) {
-	for i := 0; i < 3; i++ {
-		resp, err := c.httpClient.Get(c.apiAddress + "/domains")
+func (c *Client) send(method, path string, query url.Values, body any, accept string) (*http.Response, error) {
+	if c.apiKey == "" {
+		return nil, ErrAPIKeyRequired
+	}
+
+	var reader io.Reader
+	if body != nil {
+		data, err := json.Marshal(body)
 		if err != nil {
-			time.Sleep(PollInterval)
-			continue
+			return nil, err
 		}
+		reader = bytes.NewReader(data)
+	}
+
+	target := c.apiAddress + path
+	if len(query) > 0 {
+		target += "?" + query.Encode()
+	}
+
+	req, err := http.NewRequest(method, target, reader)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("X-API-KEY", c.apiKey)
+	req.Header.Set("Accept", accept)
+	if body != nil {
+		if method == http.MethodPatch {
+			req.Header.Set("Content-Type", contentTypeMergePatch)
+		} else {
+			req.Header.Set("Content-Type", contentTypeLD)
+		}
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+
+	if resp.StatusCode >= http.StatusBadRequest {
 		defer resp.Body.Close()
-
-		if resp.StatusCode == http.StatusOK {
-			var domainResp DomainResponse
-			if err := json.NewDecoder(resp.Body).Decode(&domainResp); err != nil {
-				return nil, fmt.Errorf("decode failed: %w", err)
-			}
-
-			domains := make([]string, len(domainResp.Member))
-			for i, d := range domainResp.Member {
-				domains[i] = d.Domain
-			}
-			return domains, nil
-		}
-		time.Sleep(PollInterval)
+		return nil, newAPIError(resp)
 	}
-	return nil, ErrNoDomains
+
+	return resp, nil
 }
 
-func (c *Client) CreateAccount(password string) (*Account, error) {
-	domains, err := c.GetDomains()
-	if err != nil {
-		return nil, err
-	}
-	if len(domains) == 0 {
-		return nil, ErrNoDomains
-	}
-
-	username := GenerateUsername(DefaultUsernameLength)
-	address := fmt.Sprintf("%s@%s", username, domains[0])
-
-	if password == "" {
-		password = GeneratePassword(DefaultPasswordLength)
-	}
-
-	account, err := c.makeAccountRequest("accounts", address, password)
-	if err != nil {
-		return nil, err
-	}
-
-	account.Password = password
-	c.account = account
-
-	if err := c.Login(address, password); err != nil {
-		return nil, err
-	}
-
-	return account, nil
-}
-
-func (c *Client) makeAccountRequest(endpoint, address, password string) (*Account, error) {
-	payload := map[string]string{
-		"address":  address,
-		"password": password,
-	}
-
-	jsonData, _ := json.Marshal(payload)
-
-	req, err := http.NewRequest(http.MethodPost, c.apiAddress+"/"+endpoint, bytes.NewBuffer(jsonData))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Accept", "application/ld+json")
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("%w: HTTP %d - %s", ErrCouldNotGetAccount, resp.StatusCode, string(body))
-	}
-
-	var account Account
-	if err := json.NewDecoder(resp.Body).Decode(&account); err != nil {
-		return nil, err
-	}
-
-	return &account, nil
-}
-
-func (c *Client) Login(address, password string) error {
-	if address == "" && c.account != nil {
-		address = c.account.Address
-		password = c.account.Password
-	}
-
-	if address == "" || password == "" {
-		return ErrAddressRequired
-	}
-
-	payload := map[string]string{
-		"address":  address,
-		"password": password,
-	}
-
-	jsonData, _ := json.Marshal(payload)
-
-	req, err := http.NewRequest(http.MethodPost, c.apiAddress+"/token", bytes.NewBuffer(jsonData))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Accept", "application/ld+json")
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := c.httpClient.Do(req)
+func (c *Client) do(method, path string, query url.Values, body any, out any) error {
+	resp, err := c.send(method, path, query, body, contentTypeLD)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("%w: HTTP %d - %s", ErrCouldNotGetAccount, resp.StatusCode, string(body))
+	if out == nil || resp.StatusCode == http.StatusNoContent {
+		io.Copy(io.Discard, resp.Body)
+		return nil
 	}
 
-	var tokenResp TokenResponse
-	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
-		return err
-	}
-
-	c.token = tokenResp.Token
-	c.authHeaders = map[string]string{
-		"Accept":        "application/ld+json",
-		"Content-Type":  "application/json",
-		"Authorization": "Bearer " + c.token,
-	}
-
-	return nil
+	return json.NewDecoder(resp.Body).Decode(out)
 }
 
-func (c *Client) GetMessages(page int) ([]Message, error) {
-	if c.token == "" {
-		return nil, ErrNotAuthenticated
-	}
-
-	if page < 1 {
-		page = 1
-	}
-
-	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("%s/messages?page=%d", c.apiAddress, page), nil)
-	if err != nil {
-		return nil, err
-	}
-	for k, v := range c.authHeaders {
-		req.Header.Set(k, v)
-	}
-
-	resp, err := c.httpClient.Do(req)
+func (c *Client) fetchBytes(path string) ([]byte, error) {
+	resp, err := c.send(http.MethodGet, path, nil, nil, "*/*")
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("%w: HTTP %d", ErrCouldNotGetMessages, resp.StatusCode)
-	}
+	return io.ReadAll(resp.Body)
+}
 
-	var hydraResp HydraResponse
-	if err := json.NewDecoder(resp.Body).Decode(&hydraResp); err != nil {
+func list[T any](c *Client, path string, query url.Values) ([]T, error) {
+	var col collection[T]
+	if err := c.do(http.MethodGet, path, query, nil, &col); err != nil {
 		return nil, err
 	}
-
-	messages := make([]Message, 0, len(hydraResp.Member))
-	for _, m := range hydraResp.Member {
-		time.Sleep(PollInterval)
-
-		fullMsg, err := c.GetMessage(m.ID)
-		if err != nil {
-			continue
-		}
-		messages = append(messages, *fullMsg)
-	}
-
-	return messages, nil
+	return col.Member, nil
 }
 
-func (c *Client) GetMessage(messageID string) (*Message, error) {
-	if c.token == "" {
-		return nil, ErrNotAuthenticated
+func newAPIError(resp *http.Response) error {
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+
+	var problem struct {
+		Message string `json:"message"`
+		Detail  string `json:"detail"`
+		Title   string `json:"title"`
 	}
-
-	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("%s/messages/%s", c.apiAddress, messageID), nil)
-	if err != nil {
-		return nil, err
-	}
-	for k, v := range c.authHeaders {
-		req.Header.Set(k, v)
-	}
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("%w: HTTP %d", ErrCouldNotGetMessages, resp.StatusCode)
-	}
-
-	var message Message
-	if err := json.NewDecoder(resp.Body).Decode(&message); err != nil {
-		return nil, err
-	}
-
-	return &message, nil
-}
-
-func (c *Client) MarkMessageSeen(messageID string) error {
-	if c.token == "" {
-		return ErrNotAuthenticated
-	}
-
-	payload := map[string]bool{"seen": true}
-	jsonData, _ := json.Marshal(payload)
-
-	req, err := http.NewRequest(http.MethodPatch, fmt.Sprintf("%s/messages/%s", c.apiAddress, messageID), bytes.NewBuffer(jsonData))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Accept", "application/ld+json")
-	req.Header.Set("Content-Type", "application/merge-patch+json")
-	req.Header.Set("Authorization", "Bearer "+c.token)
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		return fmt.Errorf("%w: HTTP %d", ErrCouldNotUpdateMessage, resp.StatusCode)
-	}
-
-	return nil
-}
-
-func (c *Client) DeleteMessage(messageID string) error {
-	if c.token == "" {
-		return ErrNotAuthenticated
-	}
-
-	req, err := http.NewRequest(http.MethodDelete, fmt.Sprintf("%s/messages/%s", c.apiAddress, messageID), nil)
-	if err != nil {
-		return err
-	}
-	for k, v := range c.authHeaders {
-		req.Header.Set(k, v)
-	}
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusNoContent {
-		return fmt.Errorf("delete failed: HTTP %d", resp.StatusCode)
-	}
-
-	return nil
-}
-
-func (c *Client) DeleteAccount() error {
-	if c.token == "" || c.account == nil {
-		return ErrNoActiveAccount
-	}
-
-	req, err := http.NewRequest(http.MethodDelete, fmt.Sprintf("%s/accounts/%s", c.apiAddress, c.account.ID), nil)
-	if err != nil {
-		return err
-	}
-	for k, v := range c.authHeaders {
-		req.Header.Set(k, v)
-	}
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusNoContent {
-		return fmt.Errorf("delete failed: HTTP %d", resp.StatusCode)
-	}
-
-	c.account = nil
-	c.token = ""
-	c.authHeaders = make(map[string]string)
-	return nil
-}
-
-func (c *Client) WaitForMessage() (*Message, error) {
-	if c.token == "" {
-		return nil, ErrNotAuthenticated
-	}
-
-	oldIDs := make(map[string]bool)
-	for {
-		messages, err := c.GetMessages(1)
-		if err == nil {
-			for _, m := range messages {
-				oldIDs[m.ID] = true
-			}
-			break
-		}
-		time.Sleep(3 * time.Second)
-	}
-
-	for {
-		time.Sleep(PollInterval)
-		messages, err := c.GetMessages(1)
-		if err != nil {
-			continue
-		}
-
-		for _, m := range messages {
-			if !oldIDs[m.ID] {
-				return &m, nil
-			}
+	msg := strings.TrimSpace(string(body))
+	if json.Unmarshal(body, &problem) == nil {
+		switch {
+		case problem.Detail != "":
+			msg = problem.Detail
+		case problem.Message != "":
+			msg = problem.Message
+		case problem.Title != "":
+			msg = problem.Title
 		}
 	}
+
+	return &APIError{StatusCode: resp.StatusCode, Message: msg}
+}
+
+func pageQuery(page int) url.Values {
+	q := url.Values{}
+	if page > 1 {
+		q.Set("page", itoa(page))
+	}
+	return q
 }
 
 func (c *Client) GetAccount() *Account {
 	return c.account
 }
 
-func (c *Client) IsAuthenticated() bool {
-	return c.token != ""
+func (c *Client) SetAccount(account *Account) {
+	c.account = account
+}
+
+func (c *Client) HasAPIKey() bool {
+	return c.apiKey != ""
 }

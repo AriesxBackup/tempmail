@@ -1,14 +1,17 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
+	"os"
+	"time"
 
 	"tempmail/pkg/tempmail"
 )
 
 func main() {
-	client := tempmail.NewClient()
+	client := tempmail.NewClient(tempmail.WithAPIKey(os.Getenv("SMTPDEV_API_KEY")))
 
 	account, err := client.CreateAccount("")
 	if err != nil {
@@ -17,17 +20,21 @@ func main() {
 
 	fmt.Printf("Email: %s\n", account.Address)
 	fmt.Printf("Password: %s\n\n", account.Password)
+	fmt.Println("Waiting for a message...")
 
-	messages, err := client.GetMessages(1)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	msg, err := client.WaitForMessage(ctx)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	fmt.Printf("Messages: %d\n", len(messages))
+	fmt.Printf("\nFrom: %s\n", msg.From.Address)
+	fmt.Printf("Subject: %s\n", msg.Subject)
+	fmt.Printf("Body: %s\n", msg.Text)
 
-	for _, msg := range messages {
-		fmt.Printf("\nFrom: %s\n", msg.From.Address)
-		fmt.Printf("Subject: %s\n", msg.Subject)
-		fmt.Printf("Body: %s\n", msg.Text)
+	if err := client.DeleteAccount(); err != nil {
+		log.Fatal(err)
 	}
 }

@@ -3,6 +3,7 @@ package tempmail
 import (
 	"crypto/rand"
 	"math/big"
+	"strconv"
 )
 
 const (
@@ -35,4 +36,12 @@ func GenerateUsername(length int) string {
 func GeneratePassword(length int) string {
 	charset := lowercaseCharset + uppercaseCharset + digitCharset
 	return GenerateRandomString(length, charset)
+}
+
+func itoa(n int) string {
+	return strconv.Itoa(n)
+}
+
+func boolString(b bool) string {
+	return strconv.FormatBool(b)
 }
